@@ -1,0 +1,82 @@
+name: probe
+# 云端外部拨测：服务器整机失联时的最后一道报警（微信推送走 WxPusher，token 存仓库 Secrets）
+# 说明：GitHub 定时任务有漂移，*/5 实际约 5~20 分钟一轮；判死延迟最坏半小时左右
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check site and alert
+        env:
+          TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          UID: ${{ secrets.WXPUSHER_UID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          # 3 次探测（间隔 25 秒），全失败才算挂
+          ok=0
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' https://niubai.vip/healthz || echo 000)
+            echo "probe $i: $code"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 25
+          done
+
+          # 上一轮本工作流的结论，用于去重与恢复通知
+          prev=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/probe.yml/runs?status=completed&per_page=1" \
+            | jq -r '.workflow_runs[0].conclusion // "none"')
+          echo "prev conclusion: $prev"
+
+          push(){
+            curl -s -X POST https://wxpusher.zjiecode.com/api/send/message \
+              -H 'Content-Type: application/json' \
+              -d "{\"appToken\":\"$TOKEN\",\"summary\":\"$1\",\"content\":\"$1\n$2\n$(TZ=Asia/Shanghai date '+%m-%d %H:%M')\",\"contentType\":1,\"uids\":[\"$UID\"]}" > /dev/null
+          }
+
+          if [ "$ok" = "1" ]; then
+            if [ "$prev" = "failure" ]; then
+              push "🟢 站点恢复了（云端拨测）" "重新可以访问了"
+            fi
+            exit 0
+          fi
+
+          if [ "$prev" = "failure" ]; then
+            # 持续宕机：约每 8 轮（1~2 小时）重复提醒一次，避免刷屏
+            if [ $(( ${{ github.run_number }} % 8 )) -ne 0 ]; then
+              echo "仍在宕机，本轮不重复推送"
+              exit 1
+            fi
+            push "🔴 站点还挂着（云端拨测）" "仍无法访问，请上服务器控制台处理"
+          else
+            push "🔴 站点挂了（云端拨测）" "云端连续 3 次探测失败。若同时没收到服务器哨兵消息，说明整机失联/断网，需上服务器控制台"
+          fi
+          exit 1
+
+  # 自续命：GitHub 对 60 天无提交的仓库会停掉定时任务；仓库安静超 20 天就空提交一次
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $(( now - last )) -gt 1728000 ]; then
+            git config user.name keepalive
+            git config user.email keepalive@users.noreply.github.com
+            git commit --allow-empty -m "keepalive $(date -u '+%Y-%m-%d')"
+            git push
+            echo "keepalive commit pushed"
+          else
+            echo "repo active enough, skip"
+          fi
